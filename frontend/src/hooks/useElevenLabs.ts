@@ -215,9 +215,9 @@ export function useElevenLabs({
       source.buffer = buffer;
       source.connect(audioContextRef.current.destination);
 
-      return new Promise<void>((resolve, reject) => {
+      return new Promise<void>((resolve) => {
         source.onended = () => resolve();
-        source.onerror = () => reject(AudioError.playbackFailed('Source playback error'));
+        // Note: AudioBufferSourceNode doesn't have onerror - errors are caught in the try/catch
         source.start();
       });
     } catch (err) {

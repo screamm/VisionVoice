@@ -1,6 +1,50 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback } from 'react';
+
+// Web Speech API type declarations (not included in standard TypeScript lib)
+interface SpeechRecognitionEvent extends Event {
+  resultIndex: number;
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionResultList {
+  length: number;
+  item(index: number): SpeechRecognitionResult;
+  [index: number]: SpeechRecognitionResult;
+}
+
+interface SpeechRecognitionResult {
+  isFinal: boolean;
+  length: number;
+  item(index: number): SpeechRecognitionAlternative;
+  [index: number]: SpeechRecognitionAlternative;
+}
+
+interface SpeechRecognitionAlternative {
+  transcript: string;
+  confidence: number;
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  error: string;
+  message: string;
+}
+
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: ((this: SpeechRecognition, ev: Event) => void) | null;
+  onaudiostart: ((this: SpeechRecognition, ev: Event) => void) | null;
+  onspeechstart: ((this: SpeechRecognition, ev: Event) => void) | null;
+  onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => void) | null;
+  onerror: ((this: SpeechRecognition, ev: SpeechRecognitionErrorEvent) => void) | null;
+  onend: ((this: SpeechRecognition, ev: Event) => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+}
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { useElevenLabsTTS } from '@/hooks/useElevenLabsTTS';
 import {
@@ -33,6 +77,18 @@ const MAX_RETRIES = 3;
 const API_TIMEOUT = 30000; // 30 seconds
 const SPEECH_NO_SPEECH_TIMEOUT = 10000; // 10 seconds without speech
 const MAX_IMAGE_SIZE_MB = 4; // Max image size for API
+const MIN_REQUEST_INTERVAL = 4000; // Minimum 4 seconds between vision requests (allows ~15 RPM safely)
+const RATE_LIMIT_STORAGE_KEY = 'visionvoice_rate_limit_until'; // Persist rate limit across page reloads
+
+// Wake words that trigger the assistant (case-insensitive)
+// Include common misrecognitions like "mission" for "vision"
+const WAKE_WORDS = [
+  'hey vision', 'vision', 'okay vision', 'hi vision',
+  'hey mission', 'mission', 'okay mission', 'hi mission',  // common mishearing
+  'a vision', 'the vision'
+];
+// Minimum words required if no wake word (to avoid single-word triggers)
+const MIN_WORDS_WITHOUT_WAKE = 3;
 
 // ============================================================================
 // Main Component
@@ -56,6 +112,14 @@ function VisionVoiceApp() {
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const noSpeechTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // Refs for tracking current state in callbacks (to avoid stale closures)
+  const isActiveRef = useRef(isActive);
+  const isListeningRef = useRef(isListening);
+  const stopSpeakingRef = useRef<() => void>(() => {});
+  const lastRequestTimeRef = useRef<number>(0);
+  const rateLimitUntilRef = useRef<number>(0);
+  const requestCountRef = useRef<number>(0); // Track requests for debugging
+  const rateLimitInitializedRef = useRef<boolean>(false);
 
   // ElevenLabs TTS Hook
   const {
@@ -108,6 +172,40 @@ function VisionVoiceApp() {
       clearErrorAfterDelay();
     }
   }, [clearErrorAfterDelay]);
+
+  // Initialize rate limit from localStorage (survives page reloads)
+  useEffect(() => {
+    if (!rateLimitInitializedRef.current) {
+      rateLimitInitializedRef.current = true;
+      try {
+        const stored = localStorage.getItem(RATE_LIMIT_STORAGE_KEY);
+        if (stored) {
+          const until = parseInt(stored, 10);
+          if (until > Date.now()) {
+            rateLimitUntilRef.current = until;
+            console.log('[RateLimit] Restored cooldown, expires in', Math.ceil((until - Date.now()) / 1000), 'seconds');
+          } else {
+            localStorage.removeItem(RATE_LIMIT_STORAGE_KEY);
+          }
+        }
+      } catch {
+        // localStorage might not be available
+      }
+    }
+  }, []);
+
+  // Keep refs in sync with state (for use in callbacks to avoid stale closures)
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
+
+  useEffect(() => {
+    isListeningRef.current = isListening;
+  }, [isListening]);
+
+  useEffect(() => {
+    stopSpeakingRef.current = stopSpeaking;
+  }, [stopSpeaking]);
 
   // ============================================================================
   // Network Status Monitoring
@@ -256,11 +354,42 @@ function VisionVoiceApp() {
       return;
     }
 
+    // Request explicit microphone permission to ensure correct device is used
+    const requestMicPermission = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Log which microphone is being used
+        const audioTrack = stream.getAudioTracks()[0];
+        console.log('[Microphone] Using:', audioTrack.label);
+        // Stop the stream - we just needed permission
+        stream.getTracks().forEach(track => track.stop());
+      } catch (err) {
+        console.error('[Microphone] Permission denied or error:', err);
+      }
+    };
+
+    requestMicPermission();
+
     try {
       const recognition = new SpeechRecognitionAPI() as SpeechRecognition;
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = 'en-US';
+
+      // Debug: Log when recognition actually starts
+      recognition.onstart = () => {
+        console.log('[SpeechRecognition] Started - listening for audio');
+      };
+
+      recognition.onaudiostart = () => {
+        console.log('[SpeechRecognition] Audio capture started - microphone is active');
+      };
+
+      recognition.onspeechstart = () => {
+        console.log('[SpeechRecognition] Speech detected!');
+        // Stop any ongoing TTS when user starts speaking (interrupt)
+        stopSpeakingRef.current();
+      };
 
       recognition.onresult = (event: SpeechRecognitionEvent) => {
         // Clear no-speech timeout on any result
@@ -270,35 +399,81 @@ function VisionVoiceApp() {
         }
 
         let finalTranscript = '';
+        let interimTranscript = '';
+
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const result = event.results[i];
+          const transcript = result[0].transcript;
+
           if (result.isFinal) {
-            finalTranscript += result[0].transcript;
+            finalTranscript += transcript;
+          } else {
+            interimTranscript += transcript;
           }
         }
 
+        // Show interim results so user knows mic is working
+        if (interimTranscript) {
+          console.log('[SpeechRecognition] Interim:', interimTranscript);
+          setTranscript(interimTranscript + '...');
+        }
+
         if (finalTranscript) {
-          setTranscript(finalTranscript);
-          handleVoiceCommand(finalTranscript);
+          console.log('[SpeechRecognition] Final:', finalTranscript);
+
+          // Check for wake word or minimum word count to avoid accidental triggers
+          const lowerTranscript = finalTranscript.toLowerCase().trim();
+          const words = lowerTranscript.split(/\s+/).filter(w => w.length > 0);
+          const hasWakeWord = WAKE_WORDS.some(wake => lowerTranscript.includes(wake));
+
+          // Remove wake word from command if present
+          let command = finalTranscript;
+          if (hasWakeWord) {
+            for (const wake of WAKE_WORDS) {
+              const wakeRegex = new RegExp(wake + '[,.]?\\s*', 'gi');
+              command = command.replace(wakeRegex, '').trim();
+            }
+          }
+
+          // Only process if: has wake word, OR has enough words for intentional command
+          if (hasWakeWord || words.length >= MIN_WORDS_WITHOUT_WAKE) {
+            setTranscript(finalTranscript);
+            // If wake word but no command, prompt user
+            if (hasWakeWord && command.length === 0) {
+              setTranscript('Listening...');
+              // Don't process empty command, wait for more input
+            } else {
+              handleVoiceCommand(command || finalTranscript);
+            }
+          } else {
+            console.log('[SpeechRecognition] Ignored (too short, no wake word):', finalTranscript);
+          }
         }
       };
 
       recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-        logError('SpeechRecognition:error', new Error(event.error), {
-          message: event.message
-        });
+        // Only log actual errors, not expected events like 'no-speech'
+        if (event.error !== 'no-speech' && event.error !== 'aborted') {
+          logError('SpeechRecognition:error', new Error(event.error), {
+            message: event.message
+          });
+        }
 
         switch (event.error) {
           case 'no-speech':
-            // Set a timeout to notify user if no speech detected for too long
+            // This is normal - recognition will automatically restart via onend handler
+            // Only show message if silence persists for extended period
             if (!noSpeechTimeoutRef.current) {
               noSpeechTimeoutRef.current = setTimeout(() => {
-                setErrorWithAutoClear({
-                  type: 'speech',
-                  message: 'No speech detected. Please speak clearly.',
-                  recoverable: true,
-                  action: 'Make sure your microphone is working'
-                });
+                // Only notify if still active and listening
+                if (isActiveRef.current && isListeningRef.current) {
+                  setErrorWithAutoClear({
+                    type: 'speech',
+                    message: 'No speech detected. Please speak clearly.',
+                    recoverable: true,
+                    action: 'Make sure your microphone is working'
+                  });
+                }
               }, SPEECH_NO_SPEECH_TIMEOUT);
             }
             break;
@@ -353,8 +528,8 @@ function VisionVoiceApp() {
           noSpeechTimeoutRef.current = null;
         }
 
-        // Restart if still active and listening
-        if (isActive && isListening) {
+        // Restart if still active and listening (use refs to get current values)
+        if (isActiveRef.current && isListeningRef.current) {
           try {
             recognition.start();
           } catch (e) {
@@ -376,7 +551,8 @@ function VisionVoiceApp() {
         clearTimeout(noSpeechTimeoutRef.current);
       }
     };
-  }, [isActive, isListening, setErrorWithAutoClear]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setErrorWithAutoClear]);
 
   // ============================================================================
   // Canvas / Image Capture
@@ -485,6 +661,14 @@ function VisionVoiceApp() {
    * Analyze image with Gemini (with retry logic and timeout)
    */
   const analyzeImage = useCallback(async (query: string, attempt = 1): Promise<string> => {
+    // Check if we're in rate limit cooldown
+    const now = Date.now();
+    if (rateLimitUntilRef.current > now) {
+      const secondsRemaining = Math.ceil((rateLimitUntilRef.current - now) / 1000);
+      console.log(`[Vision] Blocked by cooldown, ${secondsRemaining}s remaining`);
+      return `API limit still active. Please wait ${secondsRemaining} more seconds.`;
+    }
+
     // Check network status first
     if (!isOnline) {
       const errorMsg = 'No internet connection. Please check your network and try again.';
@@ -511,6 +695,8 @@ function VisionVoiceApp() {
 
     setIsProcessing(true);
     setRetryCount(attempt - 1);
+    requestCountRef.current++;
+    console.log(`[Vision] Request #${requestCountRef.current} starting for query: "${query.substring(0, 50)}..."`);
 
     try {
       // Create abort controller for timeout
@@ -533,7 +719,16 @@ function VisionVoiceApp() {
         if (res.status === 401) {
           throw new Error('API_KEY_INVALID');
         } else if (res.status === 429) {
-          throw new Error('RATE_LIMITED');
+          // Extract retry time from response if available
+          const retryAfter = errorData.retryAfter || 60;
+          const cooldownUntil = Date.now() + (retryAfter * 1000);
+          rateLimitUntilRef.current = cooldownUntil;
+          // Persist to localStorage so it survives page reloads
+          try {
+            localStorage.setItem(RATE_LIMIT_STORAGE_KEY, cooldownUntil.toString());
+          } catch { /* ignore */ }
+          console.log(`[RateLimit] Hit! Cooldown set for ${retryAfter}s. Total requests this session: ${requestCountRef.current}`);
+          throw new Error(`RATE_LIMITED:${retryAfter}`);
         } else if (res.status >= 500) {
           throw new Error('SERVER_ERROR');
         }
@@ -548,6 +743,14 @@ function VisionVoiceApp() {
         setError(null);
       }
       setRetryCount(0);
+
+      // Clear rate limit on success - we're good to go
+      rateLimitUntilRef.current = 0;
+      try {
+        localStorage.removeItem(RATE_LIMIT_STORAGE_KEY);
+      } catch { /* ignore */ }
+
+      console.log(`[Vision] Request #${requestCountRef.current} succeeded`);
 
       return data.description || 'I could not analyze the image.';
 
@@ -587,13 +790,15 @@ function VisionVoiceApp() {
           return errorMsg;
         }
 
-        if (err.message === 'RATE_LIMITED') {
-          const errorMsg = 'Too many requests. Please wait a moment and try again.';
+        if (err.message.startsWith('RATE_LIMITED')) {
+          // Extract seconds from error message (format: RATE_LIMITED:30)
+          const seconds = parseInt(err.message.split(':')[1]) || 60;
+          const errorMsg = `Google's API limit reached. Please wait about ${seconds} seconds before trying again.`;
           setErrorWithAutoClear({
             type: 'api',
             message: errorMsg,
             recoverable: true,
-            action: 'Wait a few seconds'
+            action: `Available again in ~${seconds}s`
           });
           return errorMsg;
         }
@@ -632,24 +837,8 @@ function VisionVoiceApp() {
   const handleVoiceCommand = useCallback(async (command: string) => {
     const lowerCommand = command.toLowerCase();
 
-    // Check for vision-related keywords
-    if (lowerCommand.includes('see') ||
-      lowerCommand.includes('what') ||
-      lowerCommand.includes('describe') ||
-      lowerCommand.includes('read') ||
-      lowerCommand.includes('look') ||
-      lowerCommand.includes('tell me') ||
-      lowerCommand.includes('show')) {
-
-      speak('Let me take a look...');
-      const visionResponse = await analyzeImage(command);
-      setResponse(visionResponse);
-      speak(visionResponse);
-    } else if (lowerCommand.includes('help')) {
-      const helpText = 'You can ask me things like: What do you see? Describe this room. Read this text. What is in front of me?';
-      setResponse(helpText);
-      speak(helpText);
-    } else if (lowerCommand.includes('stop') || lowerCommand.includes('pause')) {
+    // Check for control commands first
+    if (lowerCommand.includes('stop') || lowerCommand.includes('pause') || lowerCommand.includes('quiet')) {
       setIsActive(false);
       setIsListening(false);
       stopSpeaking();
@@ -660,7 +849,32 @@ function VisionVoiceApp() {
           // Ignore stop errors
         }
       }
+      return;
     }
+
+    if (lowerCommand.includes('help')) {
+      const helpText = 'You can ask me things like: What do you see? Is there something in front of me? Read this text. Describe what you see.';
+      setResponse(helpText);
+      speak(helpText);
+      return;
+    }
+
+    // Rate limiting - prevent too many requests too quickly
+    const now = Date.now();
+    const timeSinceLastRequest = now - lastRequestTimeRef.current;
+    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL && lastRequestTimeRef.current > 0) {
+      const waitTime = Math.ceil((MIN_REQUEST_INTERVAL - timeSinceLastRequest) / 1000);
+      speak(`Please wait ${waitTime} seconds before asking another question.`);
+      return;
+    }
+
+    // All other commands are treated as vision requests
+    // The user has already triggered via wake word or intentional phrase
+    lastRequestTimeRef.current = now;
+    speak('Let me take a look...');
+    const visionResponse = await analyzeImage(command);
+    setResponse(visionResponse);
+    speak(visionResponse);
   }, [analyzeImage, speak, stopSpeaking]);
 
   // ============================================================================
